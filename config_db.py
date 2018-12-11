@@ -1146,6 +1146,7 @@ class VirtualNetworkST(DBBaseST):
     # end update_pnf_presence
 
     def evaluate(self):
+        self._logger.error("evaluate  {0}  Stale RT: {1} ".format(self.name, self.stale_route_targets))
         old_virtual_network_connections = self.expand_connections()
         old_service_chains = self.service_chains
         self.connections = set()
@@ -1396,6 +1397,7 @@ class RouteTargetST(DBBaseST):
                     cls.locate(obj.get_fq_name_str(), obj)
                 else:
                     cls._vnc_lib.route_target_delete(id=obj.uuid)
+                cls._logger.error("########### DELETE RT: {} ===== with RI_BACK_REF:{} AND LR_BACK_REF:{}".format(obj.name, obj.get_routing_instance_back_refs(), obj.get_logical_router_back_refs()))
             except Exception as e:
                 cls._logger.error("Error in reinit for %s %s: %s" % (
                     cls.obj_type, obj.get_fq_name_str(), str(e)))
@@ -1960,6 +1962,7 @@ class RoutingInstanceST(DBBaseST):
                                              common.LINK_LOCAL_VN_FQ_NAME]:
             return
         self.locate_route_target()
+        self._logger.error("init_01  {0}  Stale RT: {1} RI refs: {2}".format(self.name, self.stale_route_targets, self.obj.get_routing_instance_refs()))
         for ri_ref in self.obj.get_routing_instance_refs() or []:
             conn_fq_name = ':'.join(ri_ref['to'])
             if conn_fq_name != 'ERROR':
@@ -1974,20 +1977,24 @@ class RoutingInstanceST(DBBaseST):
                 except NoIdError as e:
                     self._logger.debug("Ref not found in DB for RI " + name)
                     self._logger.debug(e)
+        self._logger.error("init_02  {0}  Stale RT: {1} is default: {2}".format(self.name, self.stale_route_targets, self.is_default))
         if self.is_default:
             vn = VirtualNetworkST.get(self.virtual_network)
+            self._logger.error("init_021  {0}  vn: {1} vn's rt {2}".format(self.name, vn.name, vn.get_route_target()))
             if vn is None:
                 return
-
+            self._logger.error("init_022  {0}  vn: {1} networks {2}".format(self.name, vn.name, vn.expand_connections()))
             for network in vn.expand_connections():
                 vn.add_ri_connection(network, self)
             # if primary RI is connected to another primary RI, we need to
             # also create connection between the VNs
+            self._logger.error("init_023  {0}  vn: {1} networks {2}".format(self.name, vn.name, self.connections))
             for connection in self.connections:
                 remote_ri_fq_name = connection.split(':')
                 if remote_ri_fq_name[-1] == remote_ri_fq_name[-2]:
                     vn.connections.add(':'.join(remote_ri_fq_name[0:-1] ))
         vmi_refs = self.obj.get_virtual_machine_interface_back_refs() or []
+        self._logger.error("init_03: {0} vmi_refs: {1} new_rtg".format(self.name, vmi_refs))
         self.virtual_machine_interfaces = set([':'.join(ref['to'])
                                               for ref in vmi_refs])
         self.update_multiple_refs('route_aggregate', self.obj)
@@ -2023,11 +2030,13 @@ class RoutingInstanceST(DBBaseST):
     # end _get_service_id_from_ri
 
     def update_routing_policy_and_aggregates(self):
+        self._logger.error("update_routing_policy_01  {0}  Stale RT: {1} ".format(self.name, self.stale_route_targets))
         if not self.service_chain:
             return
         sc = ServiceChain.get(self.service_chain)
         if sc is None:
             return
+        self._logger.error("update_routing_policy_02  {0}  Stale RT: {1} ".format(self.name, self.stale_route_targets))
         for si_name in sc.service_list:
             if not self.name.endswith(si_name.replace(':', '_')):
                 continue
@@ -2069,14 +2078,19 @@ class RoutingInstanceST(DBBaseST):
                 if ra:
                     ra.add_routing_instance(self)
             self.route_aggregates = ra_set
+        self._logger.error("update_routing_policy_03  {0}  Stale RT: {1} ".format(self.name, self.stale_route_targets))
     # end update_routing_policy_and_aggregates
 
     def import_default_ri_route_target_to_service_ri(self):
+        self._logger.error("import_def_ri_rt_01  START import_default_ri_route_target_to_service_ri: {0} ".format(self.name))
+        self._logger.error("import_def_ri_rt_02  {0}  Stale RT: {1} ".format(self.name, self.stale_route_targets))
         update_ri = False
         if not self.service_chain:
+            self._logger.error("import_def_ri_rt_03  not self.service_chain import_default_ri_route_target_to_service_ri: {0} ".format(self.name))
             return update_ri
         sc = ServiceChain.get(self.service_chain)
         if sc is None or not sc.created:
+            self._logger.error("import_def_ri_rt_04  sc is None or not sc.create import_default_ri_route_target_to_service_ri: {0} ".format(self.name))
             return update_ri
         left_vn = VirtualNetworkST.get(sc.left_vn)
         right_vn = VirtualNetworkST.get(sc.right_vn)
@@ -2088,8 +2102,10 @@ class RoutingInstanceST(DBBaseST):
             left_vn.multi_policy_service_chains_enabled and
             right_vn.multi_policy_service_chains_enabled)
         if not multi_policy_enabled:
+            self._logger.error("import_def_ri_rt_05  not multi_policy_enabled import_default_ri_route_target_to_service_ri: {0} ".format(self.name))
             return update_ri
         vn = VirtualNetworkST.get(self.virtual_network)
+        self._logger.error("import_def_ri_rt_06  VirtualNetworkST import_default_ri_route_target_to_service_ri: {0} >>> {1} ".format(self.name, vn))
         if sc.left_vn == vn.name:
             si_name = sc.service_list[0]
         elif sc.right_vn == vn.name:
@@ -2098,6 +2114,7 @@ class RoutingInstanceST(DBBaseST):
             return update_ri
         service_ri_name = vn.get_service_name(sc.name, si_name)
         if service_ri_name == self.name:
+            self._logger.error("import_def_ri_rt_07  service_ri_name == self.name import_default_ri_route_target_to_service_ri: {0} ".format(self.name))
             rt = vn.get_route_target()
             if rt not in self.stale_route_targets:
                 rt_obj = RouteTargetST.get(rt)
@@ -2110,9 +2127,10 @@ class RoutingInstanceST(DBBaseST):
     # end import_default_ri_route_target_to_service_ri
 
     def locate_route_target(self):
+        self._logger.error("locate_route_target_01  {0}  Stale RT: {1} ".format(self.name, self.stale_route_targets))
         old_rtgt = self._cassandra.get_route_target(self.name)
         rtgt_num = self._cassandra.alloc_route_target(self.name)
-
+        self._logger.error("locate_route_target_02 for: {0} old_rtg: {1} new_rtg {2} ".format(self.name, old_rtgt, rtgt_num))
         rt_key = "target:%s:%d" % (GlobalSystemConfigST.get_autonomous_system(),
                                    rtgt_num)
         rtgt_obj = RouteTargetST.locate(rt_key).obj
@@ -2122,12 +2140,12 @@ class RoutingInstanceST(DBBaseST):
             inst_tgt_data = InstanceTargetType(import_export="export")
         else:
             inst_tgt_data = None
-
+        self._logger.error("locate_route_target_03  {0}  Stale RT: {1} ".format(self.name, self.stale_route_targets))
         vn = VirtualNetworkST.get(self.virtual_network)
         if vn is None:
             self._logger.error("Parent VN not found for RI: " + self.name)
             return
-
+        self._logger.error("locate_route_target_04  {0}  Stale RT: {1} ".format(self.name, self.stale_route_targets))
         try:
             if self.obj.parent_uuid != vn.obj.uuid:
                 # Stale object. Delete it.
@@ -2137,11 +2155,27 @@ class RoutingInstanceST(DBBaseST):
                 update_ri = False
                 self.stale_route_targets = [':'.join(rt_ref['to'])
                         for rt_ref in self.obj.get_route_target_refs() or []]
+                self._logger.error("locate_route_target_05  {0}  Stale RT: {1}  rt_key {2}".format(self.name, self.stale_route_targets, rt_key))
+                #self._logger.error("QQQQQQ082  {0}  route_target_refs {1}".format(self.name, self.obj.route_target_refs))
+                for srt in self.stale_route_targets:
+                    srt_obj = RouteTargetST.locate(srt).obj
+                    srt_refs_to_lrt = srt_obj.get_logical_router_back_refs()
+                    self._logger.error("locate_route_target_04_loop {0}  vn: {1} for {3} lrt back {2}".format(self.name, vn.name, srt_refs_to_lrt, srt))
+                    # if srt_refs_to_lrt:
+                    #     for lr_ref in srt_refs_to_lrt:
+                    #         lr = LogicalRouterST.get(':'.join(lr_ref['to']))
+                    #         self._logger.error("locate_route_target_040_inloop {0}  vn: {1} lr: {2}".format(self.name, vn.name, lr.route_target))
+                    #         if srt == lr.route_target:
+                    #             self._logger.error("locate_route_target_040_inloop {0}  vn: {1} MAM HO ZMRDA".format(self.name, vn.name))
+                    #             self.stale_route_targets.remove(srt)
                 if rt_key not in self.stale_route_targets:
                     self.obj.add_route_target(rtgt_obj, InstanceTargetType())
+                    self._logger.error("locate_route_target_06  {0}  adding {1} to obj ".format(self.name, rt_key))
                     update_ri = True
                 else:
                     self.stale_route_targets.remove(rt_key)
+                    self._logger.error("locate_route_target_07  {0}  removing {1} from stale ".format(self.name, rt_key))
+                self._logger.error("locate_route_target_08  {0} inst_tgt_data {1} ".format(self.name, inst_tgt_data))
                 if inst_tgt_data:
                     for rt in vn.rt_list:
                         if rt not in self.stale_route_targets:
@@ -2176,7 +2210,9 @@ class RoutingInstanceST(DBBaseST):
                             self.stale_route_targets.remove(vn.get_route_target())
                 update_ri |= self.import_default_ri_route_target_to_service_ri()
                 if update_ri:
+                    self._logger.error("locate_route_target_09  {0}  updating".format(self.name))
                     self._vnc_lib.routing_instance_update(self.obj)
+            self._logger.error("locate_route_target_10  {0}  Stale RT: {1} ".format(self.name, self.stale_route_targets))
         except NoIdError as e:
             self._logger.error(
                 "Error while updating routing instance: " + str(e))
@@ -2191,6 +2227,7 @@ class RoutingInstanceST(DBBaseST):
             rt_key = "target:%s:%d" % (
                 GlobalSystemConfigST.get_autonomous_system(), old_rtgt)
             RouteTargetST.delete_vnc_obj(rt_key)
+        self._logger.error("locate_route_target_11  {0}  Stale RT: {1} ".format(self.name, self.stale_route_targets))
     # end locate_route_target
 
     def get_fq_name(self):
@@ -2262,6 +2299,7 @@ class RoutingInstanceST(DBBaseST):
     def update_route_target_list(self, rt_add=None, rt_add_import=None,
                                  rt_add_export=None, rt_del=None):
         update = False
+        self._logger.error("update_route_target_list_01  {0}  Stale RT: {1} rt_add: {2} rt_del: {3} ".format(self.name, self.stale_route_targets, rt_add, rt_del))
         for rt in rt_del or []:
             if rt in self.stale_route_targets:
                 self.stale_route_targets.remove(rt)
@@ -2294,6 +2332,7 @@ class RoutingInstanceST(DBBaseST):
                 self.stale_route_targets.remove(rt)
         if update:
             try:
+                self._logger.error("update_route_target_list_02  {0}  Stale RT: {1} ".format(self.name, self.stale_route_targets))
                 self._vnc_lib.routing_instance_update(self.obj)
             except NoIdError:
                 return
@@ -2302,6 +2341,7 @@ class RoutingInstanceST(DBBaseST):
     def update_static_routes(self):
         if not self.is_default:
             return
+        self._logger.error("update_static_routes_01  START: {0} ".format(self.name))
         old_static_routes = self.obj.get_static_route_entries()
         static_routes = StaticRouteEntriesType()
         old_route_target_list = set()
@@ -2311,6 +2351,7 @@ class RoutingInstanceST(DBBaseST):
         all_route_targets = set()
         si_set = ServiceInstanceST.get_vn_si_mapping(self.virtual_network)
         for si in si_set or []:
+            self._logger.error("update_static_routes_02  LOOP: {0} SI {1} ".format(self.name, si))
             mode = si.get_service_mode()
             if mode is None or mode != 'in-network-nat':
                 self._logger.debug("service mode for %s-%s, skip" % (si.name, mode))
@@ -2347,6 +2388,7 @@ class RoutingInstanceST(DBBaseST):
                     all_route_targets |= route_targets
 
         if old_route_target_list != all_route_targets:
+            self._logger.error("update_static_routes_02: {0} old_rts: {1} all_rts: {2}".format(self.name, old_route_target_list, all_route_targets))
             self.update_route_target_list(
                     rt_add_import=all_route_targets - old_route_target_list,
                     rt_del=old_route_target_list - all_route_targets)
@@ -3469,10 +3511,14 @@ class VirtualMachineInterfaceST(DBBaseST):
 
     def update(self, obj=None):
         changed = self.update_vnc_obj(obj)
+        self._logger.error("XXXXXXX update: {0} changed: {1} RI: {2}".format(self.obj.name, changed, self.routing_instances))
         if 'virtual_machine_interface_properties' in changed:
             self.set_properties()
         if 'routing_instance' in changed:
+            self._logger.error("XXXXXXX routing instance refs update for: {0} RI: {1}".format(self.obj.name,self.obj.get_routing_instance_refs()))
             self.update_routing_instances(self.obj.get_routing_instance_refs())
+        if 'logical_router' not in changed:
+            self.update_single_ref('logical_router', self.obj)
         self.update_multiple_refs('port_tuple', self.obj)
         return changed
     # end update
@@ -3523,6 +3569,7 @@ class VirtualMachineInterfaceST(DBBaseST):
     # end get_primary_instance_ip_address
 
     def set_properties(self):
+        self._logger.error("XXXXXXX set_properties: {0} name: {1} RI: {2} LR: {3}".format(self.obj.uuid, self.name, self.routing_instances, self.logical_router))
         props = self.obj.get_virtual_machine_interface_properties()
         if props:
             service_interface_type = props.service_interface_type
@@ -3537,14 +3584,17 @@ class VirtualMachineInterfaceST(DBBaseST):
         if interface_mirror != self.interface_mirror:
             self.interface_mirror = interface_mirror
             ret = True
+        self._logger.error("XXXXXXX set_properties end: {0} name: {1} RI: {2} LR: {3}".format(self.obj.uuid, self.name, self.routing_instances, self.logical_router))
         return ret
     # end set_properties
 
     def update_routing_instances(self, ri_refs):
         routing_instances = dict((':'.join(ref['to']), ref['attr'])
                                  for ref in ri_refs or [])
+        self._logger.error("update_routing_instances_01 new routing instance refs: {}".format(routing_instances))
         old_ri_set = set(self.routing_instances.keys())
         new_ri_set = set(routing_instances.keys())
+        self._logger.error("update_routing_instances_02 old refs: {0} new refs: {1}".format(old_ri_set, new_ri_set))
         for ri_name in old_ri_set - new_ri_set:
             ri = RoutingInstanceST.get(ri_name)
             if ri:
@@ -3553,6 +3603,7 @@ class VirtualMachineInterfaceST(DBBaseST):
             ri = RoutingInstanceST.get(ri_name)
             if ri:
                 ri.virtual_machine_interfaces.add(self.name)
+        self._logger.error("update_routing_instances_03 {}".format(self.name))
         self.routing_instances = routing_instances
     # end update_routing_instances
 
