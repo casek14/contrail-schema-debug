@@ -183,14 +183,17 @@ class SchemaTransformer(object):
         else:
             # Initialize logger
             self.logger = SchemaTransformerLogger(args)
+        self.logger.error("############# STARTING INITIALIZATION OF SCHEMA TRANSFORMER")
 
         # Initialize amqp
         self._vnc_amqp = STAmqpHandle(self.logger, self.REACTION_MAP,
                                       self._args, timer_obj=self.timer_obj)
+        self.logger.error("############# INITIALIZE AMPQ")
         self._vnc_amqp.establish()
         SchemaTransformer._schema_transformer = self
         try:
             # Initialize cassandra
+            self.logger.error("############# INITIALIZE CASSANDRA")
             self._object_db = SchemaTransformerDB(self, _zookeeper_client)
             DBBaseST.init(self, self.logger, self._object_db)
             DBBaseST._sandesh = self.logger._sandesh
@@ -204,10 +207,13 @@ class SchemaTransformer(object):
             SchemaTransformer.destroy_instance()
             SchemaTransformer._schema_transformer = None
             raise
+        self.logger.error("############# INITIALIZATION OF AMPQ COMPLETED")
+        self.logger.error("############# INITIALIZATION OF CASSANDRA COMPLETED")
     # end __init__
 
     # Clean up stale objects
     def reinit(self):
+        self.logger.error("############# RUNNING REINIT OF RESOURCES")
         GlobalSystemConfigST.reinit()
         BgpRouterST.reinit()
         BgpvpnST.reinit()
@@ -236,10 +242,12 @@ class SchemaTransformer(object):
         service_ri_dict = {}
         ri_deleted = {}
         for ri in DBBaseST.list_vnc_obj('routing_instance'):
+            self.logger.error("############# PROCESSING RI: {}".format(ri.get_fq_name_str()))
             delete = False
             if ri.parent_uuid not in vn_id_list:
                 delete = True
                 ri_deleted.setdefault(ri.parent_uuid, []).append(ri.uuid)
+                self.logger.error("############# RI TO DELETE: {}".format(ri.get_fq_name_str()))
             else:
                 try:
                     # if the RI was for a service chain and service chain no
@@ -261,6 +269,7 @@ class SchemaTransformer(object):
                 try:
                     ri_obj = RoutingInstanceST(ri.get_fq_name_str(), ri)
                     ri_obj.delete_obj()
+                    self.logger.error("############# RI TO DELETE: {}".format(ri_obj.name))
                 except NoIdError:
                     pass
                 except Exception as e:
@@ -292,6 +301,7 @@ class SchemaTransformer(object):
             if delete:
                 try:
                     _vnc_lib.access_control_list_delete(id=acl.uuid)
+                    self.logger.error("######### DELETING ACL:{}".format(acl.name))
                 except NoIdError:
                     pass
                 except Exception as e:
@@ -368,6 +378,7 @@ class SchemaTransformer(object):
         # evaluate virtual network objects first because other objects,
         # e.g. vmi, depend on it.
         for vn_obj in VirtualNetworkST.values():
+            self.logger.error("############# PROCESSING VN: {}".format(vn_obj.name))
             try:
                 vn_obj.evaluate()
                 self.timer_obj.timed_yield()
@@ -393,6 +404,7 @@ class SchemaTransformer(object):
     # end cleanup
 
     def process_stale_objects(self):
+        self.logger.error("####### PROCESING STALE OBJECTS")
         for sc in ServiceChain.values():
             if sc.created_stale:
                 sc.destroy()
@@ -402,6 +414,7 @@ class SchemaTransformer(object):
                 if rinst.stale_route_targets:
                     rinst.update_route_target_list(
                             rt_del=rinst.stale_route_targets)
+        self.logger.error("####### PROCESING STALE OBJECTS DONE !!!")
     # end process_stale_objects
 
     @classmethod
@@ -634,6 +647,8 @@ def run_schema_transformer(st_logger, args):
     global _vnc_lib
 
     st_logger.notice("Elected master Schema Transformer node. Initializing...")
+
+    st_logger.notice("############# INITIALIZE INTROSPECT")
     st_logger.introspect_init()
 
     def connection_state_update(status, message=None):
@@ -642,19 +657,23 @@ def run_schema_transformer(st_logger, args):
             status=status, message=message or '',
             server_addrs=['%s:%s' % (args.api_server_ip,
                                      args.api_server_port)])
+        st_logger.notice("############# UPDATE CONNECTION STATE: {}".format(status))
     # end connection_state_update
 
     # Retry till API server is up
     connected = False
     connection_state_update(ConnectionStatus.INIT)
+    st_logger.notice("############# TRY CONNECT TO API")
     while not connected:
         try:
+            st_logger.notice("############# TRYING TO CONNECT TO= {}:{}".format(args.api_server_ip, args.api_server_port))
             _vnc_lib = VncApi(
                 args.admin_user, args.admin_password, args.admin_tenant_name,
                 args.api_server_ip, args.api_server_port,
                 api_server_use_ssl=args.api_server_use_ssl)
             connected = True
             connection_state_update(ConnectionStatus.UP)
+            st_logger.notice("############# CONNECT TO API COMPLETED !!")
         except requests.exceptions.ConnectionError as e:
             # Update connection info
             connection_state_update(ConnectionStatus.DOWN, str(e))
@@ -717,10 +736,12 @@ def main(args_str=None):
     # Waiting to be elected as master node
     _zookeeper_client = ZookeeperClient(client_pfx+"schema", args.zk_server_ip,
                                         zk_timeout=args.zk_timeout)
+    st_logger.notice("Zookeeper client created ip:{}, name:{}, zk_timeout:{}".format(args.zk_server_ip, client_pfx+"schema", args.zk_timeout))
     st_logger.notice("Waiting to be elected as master...")
     _zookeeper_client.master_election(zk_path_pfx + "/schema-transformer",
                                       os.getpid(), run_schema_transformer,
                                       st_logger, args)
+    st_logger.notice("############## SCHEMA_TRANSFORMER STARTED")
 # end main
 
 
