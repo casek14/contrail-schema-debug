@@ -1146,7 +1146,6 @@ class VirtualNetworkST(DBBaseST):
     # end update_pnf_presence
 
     def evaluate(self):
-        self._logger.error("evaluate  {0}  Stale RT: {1} ".format(self.name, self.stale_route_targets))
         old_virtual_network_connections = self.expand_connections()
         old_service_chains = self.service_chains
         self.connections = set()
