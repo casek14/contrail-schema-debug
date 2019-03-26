@@ -4207,6 +4207,8 @@ class LogicalRouterST(DBBaseST):
 
         if old_rt_key:
             RouteTargetST.delete_vnc_obj(old_rt_key)
+            self._logger.error("Deleting RT_KEY: {} *** for LogicalRouter: {}").format(old_rt_key, self.name)
+
         self.route_target = rt_key
     # end __init__
 
