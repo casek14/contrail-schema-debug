@@ -16,10 +16,12 @@ import copy
 import uuid
 
 import itertools
+import socket
 import cfgm_common as common
 from netaddr import IPNetwork, IPAddress
 from cfgm_common.exceptions import NoIdError, RefsExistError, BadRequest
-from cfgm_common.exceptions import HttpError
+from cfgm_common.exceptions import HttpError, RequestSizeError
+from cfgm_common.exceptions import ResourceExhaustionError
 from cfgm_common import svc_info
 from cfgm_common.vnc_db import DBBase
 from vnc_api.vnc_api import *
@@ -28,6 +30,7 @@ from pysandesh.sandesh_base import *
 from pysandesh.sandesh_logger import *
 from cfgm_common.uve.virtual_network.ttypes import *
 from schema_transformer.sandesh.st_introspect import ttypes as sandesh
+from cfgm_common.uve.config_req.ttypes import *
 try:
     # python2.7
     from collections import OrderedDict
@@ -52,7 +55,16 @@ _PROTO_STR_TO_NUM_IPV6 = {
 }
 
 SGID_MIN_ALLOC = common.SGID_MIN_ALLOC
+RULE_IMPLICIT_ALLOW_UUID = common.RULE_IMPLICIT_ALLOW_UUID
+RULE_IMPLICIT_DENY_UUID = common.RULE_IMPLICIT_DENY_UUID
 
+def _raise_and_send_uve_to_sandesh(obj_type, err_info, sandesh):
+    config_req_err = SystemConfigReq(obj_type=obj_type,
+                                  err_info=err_info)
+    config_req_err.name = socket.gethostname()
+    config_req_trace = SystemConfigReqTrace(data=config_req_err,
+                                         sandesh=sandesh)
+    config_req_trace.send(sandesh=sandesh)
 
 def _access_control_list_update(acl_obj, name, obj, entries):
     if acl_obj is None:
@@ -66,6 +78,14 @@ def _access_control_list_update(acl_obj, name, obj, entries):
             DBBaseST._logger.error(
                 "Error while creating acl %s for %s: %s" %
                 (name, obj.get_fq_name_str(), str(e)))
+        except RequestSizeError as e:
+            # log the error and raise an alarm
+            DBBaseST._logger.error(
+                "Bottle request size error while creating acl %s for %s" %
+                (name, obj.get_fq_name_str()))
+            err_info = {'acl rule limit exceeded': True}
+            _raise_and_send_uve_to_sandesh('ACL', err_info,
+                                           DBBaseST._sandesh)
         return None
     else:
         if entries is None:
@@ -92,6 +112,14 @@ def _access_control_list_update(acl_obj, name, obj, entries):
         except NoIdError:
             DBBaseST._logger.error("NoIdError while updating acl %s for %s" %
                                    (name, obj.get_fq_name_str()))
+        except RequestSizeError as e:
+            # log the error and raise an alarm
+            DBBaseST._logger.error(
+                "Bottle request size error while creating acl %s for %s" %
+                (name, obj.get_fq_name_str()))
+            err_info = {'acl rule limit exceeded': True}
+            _raise_and_send_uve_to_sandesh('ACL', err_info,
+                                           DBBaseST._sandesh)
     return acl_obj
 # end _access_control_list_update
 
@@ -184,6 +212,8 @@ class GlobalSystemConfigST(DBBaseST):
             self.update_autonomous_system(self.obj.autonomous_system)
         if 'bgpaas_parameters' in changed:
             self.update_bgpaas_parameters(self.obj.bgpaas_parameters)
+        if 'ibgp_auto_mesh' in changed:
+            GlobalSystemConfigST.ibgp_auto_mesh = self.ibgp_auto_mesh
         return changed
     # end update
 
@@ -191,7 +221,7 @@ class GlobalSystemConfigST(DBBaseST):
         if bgpaas_params:
             new_range = {'start': bgpaas_params.port_start,
                          'end': bgpaas_params.port_end}
-            self._cassandra._bgpaas_port_allocator.reallocate([new_range])
+            self._object_db._bgpaas_port_allocator.reallocate([new_range])
 
     @classmethod
     def get_autonomous_system(cls):
@@ -223,6 +253,10 @@ class GlobalSystemConfigST(DBBaseST):
             new_rtgt_obj = RouteTargetST.locate(new_rtgt_name)
             old_rtgt_name = "target:%d:%s" % (cls._autonomous_system, target)
             old_rtgt_obj = RouteTarget(old_rtgt_name)
+
+            route_tgt.obj = RouteTargetST.read_vnc_obj(
+                fq_name=[old_rtgt_name],
+                fields=['logical_router_back_refs', 'routing_instance_back_refs'])
 
             for ri_ref in route_tgt.obj.get_routing_instance_back_refs() or []:
                 rt_inst = RoutingInstanceST.get(':'.join(ri_ref['to']))
@@ -272,22 +306,21 @@ class GlobalSystemConfigST(DBBaseST):
         for router in LogicalRouterST.values():
             router.update_autonomous_system(self._autonomous_system)
         # end for router
-        self.update_bgpaas_parameters(self.obj.bgpaas_parameters)
+        if self.obj.bgpaas_parameters:
+            self.update_bgpaas_parameters(self.obj.bgpaas_parameters)
     # end evaluate
 # end GlobalSystemConfigST
 
 
 # a struct to store attributes related to Virtual Networks needed by
 # schema transformer
-
-
 class VirtualNetworkST(DBBaseST):
     _dict = {}
     obj_type = 'virtual_network'
     ref_fields = ['network_policy', 'virtual_machine_interface', 'route_table',
-                  'bgpvpn', 'network_ipam']
+                  'bgpvpn', 'network_ipam', 'virtual_network']
     prop_fields = ['virtual_network_properties', 'route_target_list',
-                   'multi_policy_service_chains_enabled']
+                   'multi_policy_service_chains_enabled', 'is_provider_network']
 
     def me(self, name):
         return name in (self.name, 'any')
@@ -298,7 +331,10 @@ class VirtualNetworkST(DBBaseST):
         self.virtual_machine_interfaces = set()
         self.connections = set()
         self.routing_instances = set()
+        self.virtual_networks = set()
+        self.bgpvpns = set()
         self.acl = None
+        self.is_provider_network = False
         self.dynamic_acl = None
         self.acl_rule_count = 0
         self.multi_policy_service_chains_enabled = None
@@ -317,11 +353,13 @@ class VirtualNetworkST(DBBaseST):
                 self.dynamic_acl = acl_obj
 
         self.ipams = {}
-        self.get_route_target_lists(self.obj)
-        for rt in itertools.chain(self.rt_list, self.import_rt_list,
-                                  self.export_rt_list):
-            RouteTargetST.locate(rt)
         self._route_target = None
+        self.rt_list = set()
+        self.import_rt_list = set()
+        self.export_rt_list = set()
+        self.bgpvpn_rt_list = set()
+        self.bgpvpn_import_rt_list = set()
+        self.bgpvpn_export_rt_list = set()
         self.route_tables = set()
         self.service_chains = {}
         prop = self.obj.get_virtual_network_properties(
@@ -333,11 +371,9 @@ class VirtualNetworkST(DBBaseST):
         #                 following code need to be remove in release (3.2 + 1)
         nid = self.obj.get_virtual_network_network_id()
         if nid is None:
-            nid = prop.network_id or self._cassandra.alloc_vn_id(name) + 1
+            nid = prop.network_id or self._object_db.alloc_vn_id(name) + 1
             self.obj.set_virtual_network_network_id(nid)
             self._vnc_lib.virtual_network_update(self.obj)
-        if self.obj.get_fq_name() == common.IP_FABRIC_VN_FQ_NAME:
-            default_ri_fq_name = common.IP_FABRIC_RI_FQ_NAME
         elif self.obj.get_fq_name() == common.LINK_LOCAL_VN_FQ_NAME:
             default_ri_fq_name = common.LINK_LOCAL_RI_FQ_NAME
         else:
@@ -431,10 +467,12 @@ class VirtualNetworkST(DBBaseST):
                     si_name = sc.service_list[0]
                     other_vn_name = sc.right_vn
                     other_si_name = sc.service_list[-1]
+                    right_si = ServiceInstanceST.get(other_si_name)
                 elif sc.right_vn == self.name:
                     si_name = sc.service_list[-1]
                     other_vn_name = sc.left_vn
                     other_si_name = sc.service_list[0]
+                    right_si = ServiceInstanceST.get(si_name)
                 else:
                     continue
                 other_vn = VirtualNetworkST.get(other_vn_name)
@@ -442,7 +480,8 @@ class VirtualNetworkST(DBBaseST):
                     continue
                 multi_policy_enabled = (
                     self.multi_policy_service_chains_enabled and
-                    other_vn.multi_policy_service_chains_enabled)
+                    other_vn.multi_policy_service_chains_enabled and
+                    right_si.get_service_mode() != 'in-network-nat')
                 self._update_primary_ri_to_service_ri_connection(
                     sc, si_name, multi_policy_enabled)
                 other_vn._update_primary_ri_to_service_ri_connection(
@@ -494,7 +533,13 @@ class VirtualNetworkST(DBBaseST):
         self.update_multiple_refs('virtual_machine_interface', {})
         self.delete_inactive_service_chains(self.service_chains)
         for ri_name in self.routing_instances:
-            RoutingInstanceST.delete(ri_name, True)
+            ri = RoutingInstanceST.get(ri_name)
+            # Don't delete default RI, API server will do and schema will
+            # clean RT and its internal when it will receive the RI delete
+            # notification. That prevents ST to fail to delete RT because RI
+            # was not yet removed
+            if not ri.is_default:
+                ri.delete(ri_name, True)
         if self.acl:
             self._vnc_lib.access_control_list_delete(id=self.acl.uuid)
         if self.dynamic_acl:
@@ -509,9 +554,10 @@ class VirtualNetworkST(DBBaseST):
             if props:
                 nid = props.network_id
         if nid:
-            self._cassandra.free_vn_id(nid - 1)
+            self._object_db.free_vn_id(nid - 1)
 
         self.update_multiple_refs('route_table', {})
+        self.update_multiple_refs('bgpvpn', {})
         self.uve_send(deleted=True)
     # end delete_obj
 
@@ -624,46 +670,78 @@ class VirtualNetworkST(DBBaseST):
                        v.obj.get_parent_fq_name()))
     # end get_vns_in_project
 
+    def create_instance_ip(self, sc_name, family, ipam_obj):
+        iip_name = sc_name + '-' + family
+        iip_obj = InstanceIp(name=iip_name, instance_ip_family=family)
+        iip_obj.set_instance_ip_secondary(True)
+        iip_obj.add_network_ipam(ipam_obj)
+        try:
+            self._vnc_lib.instance_ip_create(iip_obj)
+        except RefsExistError:
+            pass
+        except Exception as e:
+            self._logger.error(
+                "Error while allocating ip%s address in network-ipam %s: %s"
+                % (family, ipam_obj.name, str(e)))
+            return None, None
+        iip_obj = self._vnc_lib.instance_ip_read(fq_name=[iip_name])
+        iip_uuid = iip_obj.get_uuid()
+        iip_address = iip_obj.get_instance_ip_address()
+        return iip_uuid, iip_address
+    # end create_instance_ip
+
     def allocate_service_chain_ip(self, sc_fq_name):
         sc_name = sc_fq_name.split(':')[-1]
-        v4_address, v6_address = self._cassandra.get_service_chain_ip(sc_name)
-        if v4_address or v6_address:
-            return v4_address, v6_address
-        try:
-            v4_address = self._vnc_lib.virtual_network_ip_alloc(
-                self.obj, count=1, family='v4')[0]
-        except (NoIdError, RefsExistError) as e:
-            self._logger.error(
-                "Error while allocating ipv4 in network %s: %s" % (self.name,
-                                                                   str(e)))
-        try:
-            v6_address = self._vnc_lib.virtual_network_ip_alloc(
-                self.obj, count=1, family='v6')[0]
-        except (NoIdError, RefsExistError) as e:
-            self._logger.error(
-                "Error while allocating ipv6 in network %s: %s" % (self.name,
-                                                                   str(e)))
-        if v4_address is None and v6_address is None:
+        ip_dict = self._object_db.get_service_chain_ip(sc_name)
+        if ip_dict:
+            return ip_dict.get('ip_address'), ip_dict.get('ipv6_address')
+        ip_dict = {}
+        sc_ipam_obj = ServiceChain._get_service_chain_ipam()
+        v4_iip_uuid, v4_address = \
+            self.create_instance_ip(sc_name, 'v4', ipam_obj=sc_ipam_obj)
+        if v4_iip_uuid:
+            ip_dict['ip_address'] = v4_address
+            ip_dict['ip_uuid'] = v4_iip_uuid
+        v6_iip_uuid, v6_address = \
+            self.create_instance_ip(sc_name, 'v6', ipam_obj=sc_ipam_obj)
+        if v6_iip_uuid:
+            ip_dict['ipv6_address'] = v6_address
+            ip_dict['ipv6_uuid'] = v6_iip_uuid
+        if v4_iip_uuid is None and v6_iip_uuid is None:
             return None, None
-        self._cassandra.add_service_chain_ip(sc_name, v4_address, v6_address)
+        self._object_db.add_service_chain_ip(sc_name, ip_dict)
         return v4_address, v6_address
     # end allocate_service_chain_ip
 
     def free_service_chain_ip(self, sc_fq_name):
         sc_name = sc_fq_name.split(':')[-1]
-        v4_address, v6_address = self._cassandra.get_service_chain_ip(sc_name)
-        ip_addresses = []
-        if v4_address:
-            ip_addresses.append(v4_address)
-        if v6_address:
-            ip_addresses.append(v6_address)
-        if not ip_addresses:
+        ip_dict = self._object_db.get_service_chain_ip(sc_name)
+        if not ip_dict:
             return
-        self._cassandra.remove_service_chain_ip(sc_name)
-        try:
-            self._vnc_lib.virtual_network_ip_free(self.obj, ip_addresses)
-        except NoIdError:
-            pass
+        if ip_dict.get('ip_uuid'):
+            try:
+                self._vnc_lib.instance_ip_delete(id=ip_dict['ip_uuid'])
+            except NoIdError:
+                pass
+        elif ip_dict.get('ip_address'):
+            # To Handle old scheme
+            try:
+                self._vnc_lib.virtual_network_ip_free(self.obj, ip_dict[ip_address])
+            except NoIdError:
+                pass
+
+        if ip_dict.get('ipv6_uuid'):
+            try:
+                self._vnc_lib.instance_ip_delete(id=ip_dict['ipv6_uuid'])
+            except NoIdError:
+                pass
+        elif ip_dict.get('ipv6_address'):
+            # To Handle old scheme
+            try:
+                self._vnc_lib.virtual_network_ip_free(self.obj, ip_dict[ipv6_address])
+            except NoIdError:
+                pass
+        self._object_db.remove_service_chain_ip(sc_name)
     # end free_service_chain_ip
 
     def get_route_target(self):
@@ -672,7 +750,7 @@ class VirtualNetworkST(DBBaseST):
             if ri is None:
                 return
             ri_name = ri.get_fq_name_str()
-            self._route_target = self._cassandra.get_route_target(ri_name)
+            self._route_target = self._object_db.get_route_target(ri_name)
         rtgt_name = "target:%s:%d" % (
                     GlobalSystemConfigST.get_autonomous_system(),
                     self._route_target)
@@ -768,6 +846,17 @@ class VirtualNetworkST(DBBaseST):
         else:
             self.export_rt_list = set()
 
+        # Get BGP VPN's route targets associated to that network
+        self.bgpvpn_rt_list = set()
+        self.bgpvpn_import_rt_list = set()
+        self.bgpvpn_export_rt_list = set()
+        for bgpvpn_name in self.bgpvpns:
+            bgpvpn = BgpvpnST.get(bgpvpn_name)
+            if bgpvpn is not None:
+                self.bgpvpn_rt_list |= bgpvpn.rt_list
+                self.bgpvpn_import_rt_list |= bgpvpn.import_rt_list
+                self.bgpvpn_export_rt_list |= bgpvpn.export_rt_list
+
         # if any RT exists in both import and export, just add it to rt_list
         self.rt_list |= self.import_rt_list & self.export_rt_list
         # if any RT exists in rt_list, remove it from import/export lists
@@ -776,22 +865,39 @@ class VirtualNetworkST(DBBaseST):
     # end get_route_target_lists
 
     def set_route_target_list(self, obj):
-        ri = self.get_primary_routing_instance()
-        old_rt_list = set(self.rt_list)
-        old_import_rt_list = set(self.import_rt_list)
-        old_export_rt_list = set(self.export_rt_list)
-        self.get_route_target_lists(obj)
+        old_rt_list = self.rt_list.copy()
+        old_import_rt_list = self.import_rt_list.copy()
+        old_export_rt_list = self.export_rt_list.copy()
+        old_bgpvpn_rt_list = self.bgpvpn_rt_list.copy()
+        old_bgpvpn_import_rt_list = self.bgpvpn_import_rt_list.copy()
+        old_bgpvpn_export_rt_list = self.bgpvpn_export_rt_list.copy()
 
-        rt_add = self.rt_list - old_rt_list
-        rt_add_export = self.export_rt_list - old_export_rt_list
-        rt_add_import = self.import_rt_list - old_import_rt_list
-        rt_del = ((old_rt_list - self.rt_list) |
-                  (old_export_rt_list - self.export_rt_list) |
-                  (old_import_rt_list - self.import_rt_list))
+        self.get_route_target_lists(obj)
+        rt_add = ((self.rt_list - old_rt_list) |
+                  (self.bgpvpn_rt_list - old_bgpvpn_rt_list))
+        rt_add_import = ((self.import_rt_list - old_import_rt_list) |
+                         (self.bgpvpn_import_rt_list -
+                          old_bgpvpn_import_rt_list))
+        rt_add_export = ((self.export_rt_list - old_export_rt_list) |
+                         (self.bgpvpn_export_rt_list -
+                          old_bgpvpn_export_rt_list))
+        rt_del = (
+            ((old_rt_list - self.rt_list) |
+             (old_import_rt_list - self.import_rt_list) |
+             (old_export_rt_list - self.export_rt_list) |
+             (old_bgpvpn_rt_list - self.bgpvpn_rt_list) |
+             (old_bgpvpn_import_rt_list - self.bgpvpn_import_rt_list) |
+             (old_bgpvpn_export_rt_list - self.bgpvpn_export_rt_list)) -
+            (self.rt_list | self.import_rt_list | self.export_rt_list |
+             self.bgpvpn_rt_list | self.bgpvpn_import_rt_list |
+             self.bgpvpn_export_rt_list)
+        )
         if not (rt_add or rt_add_export or rt_add_import or rt_del):
             return False
         for rt in itertools.chain(rt_add, rt_add_export, rt_add_import):
             RouteTargetST.locate(rt)
+
+        ri = self.get_primary_routing_instance()
         if ri:
             ri.update_route_target_list(rt_add=rt_add,
                                         rt_add_import=rt_add_import,
@@ -927,7 +1033,12 @@ class VirtualNetworkST(DBBaseST):
             vmi = VirtualMachineInterfaceST.get(vmi_name)
             if vmi and vmi.is_left():
                 vn_analyzer = vmi.virtual_network
-                ip_analyzer = vmi.get_any_instance_ip_address()
+                ip_version = None
+                if vmi.get_primary_instance_ip_address(ip_version=4):
+                    ip_version = 4
+                elif vmi.get_primary_instance_ip_address(ip_version=6):
+                    ip_version = 6
+                ip_analyzer = vmi.get_any_instance_ip_address(ip_version)
                 break
         # end for vmi_ref
         return (vn_analyzer, ip_analyzer)
@@ -1102,8 +1213,9 @@ class VirtualNetworkST(DBBaseST):
                         prule.action_list, prule.direction, service_ri)
                     result_acl_rule_list.append(acl)
                     acl_direction_comp = self._manager._args.acl_direction_comp
-                    if ((prule.direction == "<>") and (sa != da or sp != dp)
-                         and (not acl_direction_comp)):
+                    if ((prule.direction == "<>") and
+                            (sa != da or sp != dp) and
+                            (not acl_direction_comp)):
                         acl = self.add_acl_rule(
                             da, dp, sa, sp, arule_proto, rule_uuid,
                             prule.action_list, prule.direction, service_ri)
@@ -1116,7 +1228,7 @@ class VirtualNetworkST(DBBaseST):
     # end policy_to_acl_rule
 
     def add_acl_rule(self, sa, sp, da, dp, proto, rule_uuid, action, direction,
-                     service_ri = None):
+                     service_ri=None):
         action_list = copy.deepcopy(action)
         action_list.set_assign_routing_instance(service_ri)
         match = MatchConditionType(proto, sa, sp, da, dp)
@@ -1146,6 +1258,8 @@ class VirtualNetworkST(DBBaseST):
     # end update_pnf_presence
 
     def evaluate(self):
+        self.set_route_target_list(self.obj)
+
         old_virtual_network_connections = self.expand_connections()
         old_service_chains = self.service_chains
         self.connections = set()
@@ -1154,6 +1268,11 @@ class VirtualNetworkST(DBBaseST):
 
         static_acl_entries = None
         dynamic_acl_entries = None
+        # add a static acl in case of provider-network
+        if (not self.network_policys and
+            (self.is_provider_network or self.virtual_networks)):
+            static_acl_entries = AclEntriesType(dynamic=False)
+
         for policy_name in self.network_policys:
             timer = self.network_policys[policy_name].get_timer()
             if timer is None:
@@ -1192,7 +1311,21 @@ class VirtualNetworkST(DBBaseST):
                             other_vn = VirtualNetworkST.get(connected_network)
                             if not other_vn:
                                 continue
-                            if other_vn.multi_policy_service_chains_enabled:
+                            # check to see if service chain(s) between the two
+                            # networks associated with a policy has service of
+                            # type 'in-network-nat, in which case we shouldn't
+                            # connect the two networks directly
+                            nat_service = False
+                            sc_list = self.service_chains[connected_network]
+                            for sc in sc_list:
+                                if sc is not None and sc.created:
+                                    right_si_name = sc.service_list[-1]
+                                    right_si = ServiceInstanceST.get(right_si_name)
+                                    if right_si.get_service_mode() == 'in-network-nat':
+                                        nat_service = True
+                                        break
+
+                            if other_vn.multi_policy_service_chains_enabled and not nat_service:
                                 self.add_connection(connected_network)
                         continue
 
@@ -1213,7 +1346,7 @@ class VirtualNetworkST(DBBaseST):
                 "any", AddressType(virtual_network=self.name), PortType(),
                 AddressType(virtual_network=self.name), PortType())
             action = ActionListType("pass")
-            acl = AclRuleType(match, action)
+            acl = AclRuleType(match, action, RULE_IMPLICIT_ALLOW_UUID)
             acl_list.append(acl)
 
             if self._manager._args.logical_routers_enabled:
@@ -1227,27 +1360,58 @@ class VirtualNetworkST(DBBaseST):
                         dst_address.subnet = None
                         dst_address.subnet_list = []
 
-                    acl = self.add_acl_rule(src_address, PortType(), dst_address,
-                                       PortType(), "any", rule.get_rule_uuid(),
-                                       ActionListType("deny"), rule.direction)
+                    acl = self.add_acl_rule(
+                        src_address, PortType(), dst_address, PortType(),
+                        "any", rule.get_rule_uuid(), ActionListType("deny"),
+                        rule.direction)
 
                     acl_list.append(acl)
 
                     acl_direction_comp = self._manager._args.acl_direction_comp
-                    if ((rule.direction == "<>") and (src_address != dst_address)
-                         and (not acl_direction_comp)):
-                        acl = self.add_acl_rule(src_address, PortType(), dst_address,
-                                           PortType(), "any", rule.get_rule_uuid(),
-                                           ActionListType("deny"), rule.direction)
+                    if ((rule.direction == "<>") and
+                            (src_address != dst_address) and
+                            (not acl_direction_comp)):
+                        acl = self.add_acl_rule(
+                            src_address, PortType(), dst_address, PortType(),
+                            "any", rule.get_rule_uuid(),
+                            ActionListType("deny"), rule.direction)
                         acl_list.append(acl)
                 # end for rule
+
+                # Add provider-network to any vn deny
+                if self.is_provider_network:
+                    provider_to_any_acl = self.add_acl_rule(
+                        AddressType(virtual_network=self.name),
+                        PortType(),
+                        AddressType(virtual_network="any"),
+                        PortType(),
+                        "any",
+                        RULE_IMPLICIT_DENY_UUID,
+                        ActionListType("deny"),
+                        '<>')
+                    acl_list.append(provider_to_any_acl)
+                else:
+                    # If this VN is linked to a provider-network, add
+                    # provider-vn <-> this-VN deny
+                    for provider_vn in self.virtual_networks:
+                        # add this vn to provider-network deny
+                        this_vn_to_provider_acl = self.add_acl_rule(
+                            AddressType(virtual_network=self.name),
+                            PortType(),
+                            AddressType(virtual_network=provider_vn),
+                            PortType(),
+                            "any",
+                            RULE_IMPLICIT_DENY_UUID,
+                            ActionListType("deny"),
+                            '<>')
+                        acl_list.append(this_vn_to_provider_acl)
 
                 # Create any-vn to any-vn allow
                 match = MatchConditionType(
                     "any", AddressType(virtual_network="any"), PortType(),
                     AddressType(virtual_network="any"), PortType())
                 action = ActionListType("pass")
-                acl = AclRuleType(match, action)
+                acl = AclRuleType(match, action, RULE_IMPLICIT_ALLOW_UUID)
                 acl_list.append(acl)
                 acl_list.update_acl_entries(static_acl_entries)
             else:
@@ -1256,11 +1420,10 @@ class VirtualNetworkST(DBBaseST):
                     "any", AddressType(virtual_network="any"), PortType(),
                     AddressType(virtual_network="any"), PortType())
                 action = ActionListType("deny")
-                acl = AclRuleType(match, action)
+                acl = AclRuleType(match, action, RULE_IMPLICIT_DENY_UUID)
                 acl_list.append(acl)
                 acl_list.update_acl_entries(static_acl_entries)
             self.acl_rule_count = len(static_acl_entries.get_acl_rule())
-
 
         self.acl = _access_control_list_update(self.acl, self.obj.name,
                                                self.obj, static_acl_entries)
@@ -1365,12 +1528,17 @@ class VirtualNetworkST(DBBaseST):
                              ', '.join(self.import_rt_list)),
             sandesh.PropList('export_rt_list',
                              ', '.join(self.export_rt_list)),
+            sandesh.PropList('bgpvpn_rt_list', ', '.join(self.bgpvpn_rt_list)),
+            sandesh.PropList('bgpvpn_import_rt_list',
+                             ', '.join(self.bgpvpn_import_rt_list)),
+            sandesh.PropList('bgpvpn_export_rt_list',
+                             ', '.join(self.bgpvpn_export_rt_list)),
         ])
         return resp
     # end handle_st_object_req
 
     def get_gateway(self, address):
-        """Returns the defualt gateway of the network
+        """Returns the default gateway of the network
         to which the 'address' belongs
         """
         for ipam in self.ipams.values():
@@ -1395,17 +1563,16 @@ class RouteTargetST(DBBaseST):
                         obj.get_logical_router_back_refs()):
                     cls.locate(obj.get_fq_name_str(), obj)
                 else:
-                    cls._vnc_lib.route_target_delete(id=obj.uuid)
-                cls._logger.error("########### DELETE RT: {} ===== with RI_BACK_REF:{} AND LR_BACK_REF:{}".format(obj.name, obj.get_routing_instance_back_refs(), obj.get_logical_router_back_refs()))
+                    cls.delete_vnc_obj(obj.get_fq_name_str())
             except Exception as e:
                 cls._logger.error("Error in reinit for %s %s: %s" % (
                     cls.obj_type, obj.get_fq_name_str(), str(e)))
-        for ri, val in cls._cassandra._rt_cf.get_range():
+        for ri, val in cls._object_db._rt_cf.get_range():
             rt = val['rtgt_num']
             asn = GlobalSystemConfigST.get_autonomous_system()
             rt_key = "target:%s:%s" % (asn, rt)
             if rt_key not in cls:
-                cls._cassandra.free_route_target(ri)
+                cls._object_db.free_route_target(ri)
     # end reinit
 
     def __init__(self, rt_key, obj=None):
@@ -1449,6 +1616,7 @@ class NetworkPolicyST(DBBaseST):
         self.internal = False
         self.rules = []
         self.has_subnet_only_rules = True
+        self.security_logging_objects = set()
         # policies referred in this policy as src or dst
         self.referred_policies = set()
         # policies referring to this policy as src or dst
@@ -1462,6 +1630,7 @@ class NetworkPolicyST(DBBaseST):
             vnp = VirtualNetworkPolicyType(**vn_ref['attr'])
             vn.add_policy(name, vnp)
         self.network_policys = NetworkPolicyST._network_policys.get(name, set())
+        self.update_multiple_refs('security_logging_object', self.obj)
     # end __init__
 
     def skip_evaluate(self, from_type):
@@ -1703,6 +1872,7 @@ class SecurityGroupST(DBBaseST):
         self.egress_acl = None
         self.referred_sgs = set()
         self.security_group_entries = None
+        self.security_logging_objects = set()
         acls = self.obj.get_access_control_lists()
         for acl in acls or []:
             if acl['to'][-1] == 'egress-access-control-list':
@@ -1713,6 +1883,7 @@ class SecurityGroupST(DBBaseST):
                 self._vnc_lib.access_control_list_delete(id=acl['uuid'])
         self.update(self.obj)
         self.security_groups = SecurityGroupST._sg_dict.get(name, set())
+        self.update_multiple_refs('security_logging_object', self.obj)
     # end __init__
 
     def update(self, obj=None):
@@ -1721,7 +1892,8 @@ class SecurityGroupST(DBBaseST):
         #                 allocation in schema and in the vnc API for one
         #                 release overlap to prevent any upgrade issue. So the
         #                 following code need to be remove in release (3.2 + 1)
-        if 'configured_security_group_id' in changed:
+        if ('configured_security_group_id' in changed or
+                self.obj.get_security_group_id() is None):
             self.set_configured_security_group_id()
         if changed:
             self.process_referred_sgs()
@@ -1774,24 +1946,25 @@ class SecurityGroupST(DBBaseST):
         if config_id:
             if sg_id is not None:
                 if sg_id > SGID_MIN_ALLOC:
-                    self._cassandra.free_sg_id(sg_id - SGID_MIN_ALLOC)
+                    self._object_db.free_sg_id(sg_id - SGID_MIN_ALLOC)
                 else:
-                    if self.name == self._cassandra.get_sg_from_id(sg_id):
-                        self._cassandra.free_sg_id(sg_id)
+                    if self.name == self._object_db.get_sg_from_id(sg_id):
+                        self._object_db.free_sg_id(sg_id)
             self.obj.set_security_group_id(str(config_id))
         else:
             do_alloc = False
             if sg_id is not None:
                 if sg_id < SGID_MIN_ALLOC:
-                    if self.name == self._cassandra.get_sg_from_id(sg_id):
-                        self.obj.set_security_group_id(sg_id + SGID_MIN_ALLOC)
+                    if self.name == self._object_db.get_sg_from_id(sg_id):
+                        self.obj.set_security_group_id(
+                            str(sg_id + SGID_MIN_ALLOC))
                     else:
                         do_alloc = True
             else:
                 do_alloc = True
             if do_alloc:
-                sg_id_num = self._cassandra.alloc_sg_id(self.name)
-                self.obj.set_security_group_id(sg_id_num + SGID_MIN_ALLOC)
+                sg_id_num = self._object_db.alloc_sg_id(self.name)
+                self.obj.set_security_group_id(str(sg_id_num + SGID_MIN_ALLOC))
         if sg_id != int(self.obj.get_security_group_id()):
             self._vnc_lib.security_group_update(self.obj)
         self.sg_id = self.obj.get_security_group_id()
@@ -1810,9 +1983,9 @@ class SecurityGroupST(DBBaseST):
         sg_id = self.obj.get_security_group_id()
         if sg_id is not None and not self.configured_security_group_id:
             if sg_id < SGID_MIN_ALLOC:
-                self._cassandra.free_sg_id(sg_id)
+                self._object_db.free_sg_id(sg_id)
             else:
-                self._cassandra.free_sg_id(sg_id-SGID_MIN_ALLOC)
+                self._object_db.free_sg_id(sg_id-SGID_MIN_ALLOC)
         self.security_group_entries = None
         self.process_referred_sgs()
     # end delete_obj
@@ -1957,11 +2130,10 @@ class RoutingInstanceST(DBBaseST):
         self.route_aggregates = set()
         self.service_chain_info = self.obj.get_service_chain_information()
         self.v6_service_chain_info = self.obj.get_ipv6_service_chain_information()
-        if self.obj.get_parent_fq_name() in [common.IP_FABRIC_VN_FQ_NAME,
-                                             common.LINK_LOCAL_VN_FQ_NAME]:
+        if self.obj.get_fq_name() in (common.IP_FABRIC_RI_FQ_NAME,
+                                      common.LINK_LOCAL_RI_FQ_NAME):
             return
         self.locate_route_target()
-        self._logger.error("init_01  {0}  Stale RT: {1} RI refs: {2}".format(self.name, self.stale_route_targets, self.obj.get_routing_instance_refs()))
         for ri_ref in self.obj.get_routing_instance_refs() or []:
             conn_fq_name = ':'.join(ri_ref['to'])
             if conn_fq_name != 'ERROR':
@@ -1976,24 +2148,20 @@ class RoutingInstanceST(DBBaseST):
                 except NoIdError as e:
                     self._logger.debug("Ref not found in DB for RI " + name)
                     self._logger.debug(e)
-        self._logger.error("init_02  {0}  Stale RT: {1} is default: {2}".format(self.name, self.stale_route_targets, self.is_default))
         if self.is_default:
             vn = VirtualNetworkST.get(self.virtual_network)
-            self._logger.error("init_021  {0}  vn: {1} vn's rt {2}".format(self.name, vn.name, vn.get_route_target()))
             if vn is None:
                 return
-            self._logger.error("init_022  {0}  vn: {1} networks {2}".format(self.name, vn.name, vn.expand_connections()))
+
             for network in vn.expand_connections():
                 vn.add_ri_connection(network, self)
             # if primary RI is connected to another primary RI, we need to
             # also create connection between the VNs
-            self._logger.error("init_023  {0}  vn: {1} networks {2}".format(self.name, vn.name, self.connections))
             for connection in self.connections:
                 remote_ri_fq_name = connection.split(':')
                 if remote_ri_fq_name[-1] == remote_ri_fq_name[-2]:
-                    vn.connections.add(':'.join(remote_ri_fq_name[0:-1] ))
+                    vn.connections.add(':'.join(remote_ri_fq_name[0:-1]))
         vmi_refs = self.obj.get_virtual_machine_interface_back_refs() or []
-        self._logger.error("init_03: {0} vmi_refs: {1} new_rtg".format(self.name, vmi_refs))
         self.virtual_machine_interfaces = set([':'.join(ref['to'])
                                               for ref in vmi_refs])
         self.update_multiple_refs('route_aggregate', self.obj)
@@ -2029,13 +2197,11 @@ class RoutingInstanceST(DBBaseST):
     # end _get_service_id_from_ri
 
     def update_routing_policy_and_aggregates(self):
-        self._logger.error("update_routing_policy_01  {0}  Stale RT: {1} ".format(self.name, self.stale_route_targets))
         if not self.service_chain:
             return
         sc = ServiceChain.get(self.service_chain)
         if sc is None:
             return
-        self._logger.error("update_routing_policy_02  {0}  Stale RT: {1} ".format(self.name, self.stale_route_targets))
         for si_name in sc.service_list:
             if not self.name.endswith(si_name.replace(':', '_')):
                 continue
@@ -2077,19 +2243,14 @@ class RoutingInstanceST(DBBaseST):
                 if ra:
                     ra.add_routing_instance(self)
             self.route_aggregates = ra_set
-        self._logger.error("update_routing_policy_03  {0}  Stale RT: {1} ".format(self.name, self.stale_route_targets))
     # end update_routing_policy_and_aggregates
 
     def import_default_ri_route_target_to_service_ri(self):
-        self._logger.error("import_def_ri_rt_01  START import_default_ri_route_target_to_service_ri: {0} ".format(self.name))
-        self._logger.error("import_def_ri_rt_02  {0}  Stale RT: {1} ".format(self.name, self.stale_route_targets))
         update_ri = False
         if not self.service_chain:
-            self._logger.error("import_def_ri_rt_03  not self.service_chain import_default_ri_route_target_to_service_ri: {0} ".format(self.name))
             return update_ri
         sc = ServiceChain.get(self.service_chain)
         if sc is None or not sc.created:
-            self._logger.error("import_def_ri_rt_04  sc is None or not sc.create import_default_ri_route_target_to_service_ri: {0} ".format(self.name))
             return update_ri
         left_vn = VirtualNetworkST.get(sc.left_vn)
         right_vn = VirtualNetworkST.get(sc.right_vn)
@@ -2097,14 +2258,16 @@ class RoutingInstanceST(DBBaseST):
             self._logger.debug("left or right vn not found for RI " + self.name)
             return update_ri
 
+        right_si_name = sc.service_list[-1]
+        right_si = ServiceInstanceST.get(right_si_name)
         multi_policy_enabled = (
             left_vn.multi_policy_service_chains_enabled and
-            right_vn.multi_policy_service_chains_enabled)
+            right_vn.multi_policy_service_chains_enabled and
+            right_si.get_service_mode() != 'in-network-nat')
+
         if not multi_policy_enabled:
-            self._logger.error("import_def_ri_rt_05  not multi_policy_enabled import_default_ri_route_target_to_service_ri: {0} ".format(self.name))
             return update_ri
         vn = VirtualNetworkST.get(self.virtual_network)
-        self._logger.error("import_def_ri_rt_06  VirtualNetworkST import_default_ri_route_target_to_service_ri: {0} >>> {1} ".format(self.name, vn))
         if sc.left_vn == vn.name:
             si_name = sc.service_list[0]
         elif sc.right_vn == vn.name:
@@ -2113,7 +2276,6 @@ class RoutingInstanceST(DBBaseST):
             return update_ri
         service_ri_name = vn.get_service_name(sc.name, si_name)
         if service_ri_name == self.name:
-            self._logger.error("import_def_ri_rt_07  service_ri_name == self.name import_default_ri_route_target_to_service_ri: {0} ".format(self.name))
             rt = vn.get_route_target()
             if rt not in self.stale_route_targets:
                 rt_obj = RouteTargetST.get(rt)
@@ -2126,10 +2288,9 @@ class RoutingInstanceST(DBBaseST):
     # end import_default_ri_route_target_to_service_ri
 
     def locate_route_target(self):
-        self._logger.error("locate_route_target_01  {0}  Stale RT: {1} ".format(self.name, self.stale_route_targets))
-        old_rtgt = self._cassandra.get_route_target(self.name)
-        rtgt_num = self._cassandra.alloc_route_target(self.name)
-        self._logger.error("locate_route_target_02 for: {0} old_rtg: {1} new_rtg {2} ".format(self.name, old_rtgt, rtgt_num))
+        old_rtgt = self._object_db.get_route_target(self.name)
+        rtgt_num = self._object_db.alloc_route_target(self.name)
+
         rt_key = "target:%s:%d" % (GlobalSystemConfigST.get_autonomous_system(),
                                    rtgt_num)
         rtgt_obj = RouteTargetST.locate(rt_key).obj
@@ -2139,12 +2300,12 @@ class RoutingInstanceST(DBBaseST):
             inst_tgt_data = InstanceTargetType(import_export="export")
         else:
             inst_tgt_data = None
-        self._logger.error("locate_route_target_03  {0}  Stale RT: {1} ".format(self.name, self.stale_route_targets))
+
         vn = VirtualNetworkST.get(self.virtual_network)
         if vn is None:
             self._logger.error("Parent VN not found for RI: " + self.name)
             return
-        self._logger.error("locate_route_target_04  {0}  Stale RT: {1} ".format(self.name, self.stale_route_targets))
+
         try:
             if self.obj.parent_uuid != vn.obj.uuid:
                 # Stale object. Delete it.
@@ -2154,29 +2315,13 @@ class RoutingInstanceST(DBBaseST):
                 update_ri = False
                 self.stale_route_targets = [':'.join(rt_ref['to'])
                         for rt_ref in self.obj.get_route_target_refs() or []]
-                self._logger.error("locate_route_target_05  {0}  Stale RT: {1}  rt_key {2}".format(self.name, self.stale_route_targets, rt_key))
-                #self._logger.error("QQQQQQ082  {0}  route_target_refs {1}".format(self.name, self.obj.route_target_refs))
-                for srt in self.stale_route_targets:
-                    srt_obj = RouteTargetST.locate(srt).obj
-                    srt_refs_to_lrt = srt_obj.get_logical_router_back_refs()
-                    self._logger.error("locate_route_target_04_loop {0}  vn: {1} for {3} lrt back {2}".format(self.name, vn.name, srt_refs_to_lrt, srt))
-                    # if srt_refs_to_lrt:
-                    #     for lr_ref in srt_refs_to_lrt:
-                    #         lr = LogicalRouterST.get(':'.join(lr_ref['to']))
-                    #         self._logger.error("locate_route_target_040_inloop {0}  vn: {1} lr: {2}".format(self.name, vn.name, lr.route_target))
-                    #         if srt == lr.route_target:
-                    #             self._logger.error("locate_route_target_040_inloop {0}  vn: {1} MAM HO ZMRDA".format(self.name, vn.name))
-                    #             self.stale_route_targets.remove(srt)
                 if rt_key not in self.stale_route_targets:
                     self.obj.add_route_target(rtgt_obj, InstanceTargetType())
-                    self._logger.error("locate_route_target_06  {0}  adding {1} to obj ".format(self.name, rt_key))
                     update_ri = True
                 else:
                     self.stale_route_targets.remove(rt_key)
-                    self._logger.error("locate_route_target_07  {0}  removing {1} from stale ".format(self.name, rt_key))
-                self._logger.error("locate_route_target_08  {0} inst_tgt_data {1} ".format(self.name, inst_tgt_data))
                 if inst_tgt_data:
-                    for rt in vn.rt_list:
+                    for rt in vn.rt_list | vn.bgpvpn_rt_list:
                         if rt not in self.stale_route_targets:
                             rtgt_obj = RouteTargetST.locate(rt)
                             self.obj.add_route_target(rtgt_obj.obj, inst_tgt_data)
@@ -2184,7 +2329,8 @@ class RoutingInstanceST(DBBaseST):
                         else:
                             self.stale_route_targets.remove(rt)
                     if self.is_default:
-                        for rt in vn.export_rt_list:
+                        for rt in (vn.export_rt_list |
+                                   vn.bgpvpn_export_rt_list):
                             if rt not in self.stale_route_targets:
                                 rtgt_obj = RouteTargetST.locate(rt)
                                 self.obj.add_route_target(
@@ -2192,7 +2338,8 @@ class RoutingInstanceST(DBBaseST):
                                 update_ri = True
                             else:
                                 self.stale_route_targets.remove(rt)
-                        for rt in vn.import_rt_list:
+                        for rt in (vn.import_rt_list |
+                                   vn.bgpvpn_import_rt_list):
                             if rt not in self.stale_route_targets:
                                 rtgt_obj = RouteTargetST.locate(rt)
                                 self.obj.add_route_target(
@@ -2209,9 +2356,13 @@ class RoutingInstanceST(DBBaseST):
                             self.stale_route_targets.remove(vn.get_route_target())
                 update_ri |= self.import_default_ri_route_target_to_service_ri()
                 if update_ri:
-                    self._logger.error("locate_route_target_09  {0}  updating".format(self.name))
-                    self._vnc_lib.routing_instance_update(self.obj)
-            self._logger.error("locate_route_target_10  {0}  Stale RT: {1} ".format(self.name, self.stale_route_targets))
+                    try:
+                        self._vnc_lib.routing_instance_update(self.obj)
+                    except Exception as e:
+                        # error due to inconsistency in db
+                        self._logger.error(
+                            "Error while updating routing instance: " + str(e))
+                    return
         except NoIdError as e:
             self._logger.error(
                 "Error while updating routing instance: " + str(e))
@@ -2226,7 +2377,6 @@ class RoutingInstanceST(DBBaseST):
             rt_key = "target:%s:%d" % (
                 GlobalSystemConfigST.get_autonomous_system(), old_rtgt)
             RouteTargetST.delete_vnc_obj(rt_key)
-        self._logger.error("locate_route_target_11  {0}  Stale RT: {1} ".format(self.name, self.stale_route_targets))
     # end locate_route_target
 
     def get_fq_name(self):
@@ -2298,7 +2448,6 @@ class RoutingInstanceST(DBBaseST):
     def update_route_target_list(self, rt_add=None, rt_add_import=None,
                                  rt_add_export=None, rt_del=None):
         update = False
-        self._logger.error("update_route_target_list_01  {0}  Stale RT: {1} rt_add: {2} rt_del: {3} ".format(self.name, self.stale_route_targets, rt_add, rt_del))
         for rt in rt_del or []:
             if rt in self.stale_route_targets:
                 self.stale_route_targets.remove(rt)
@@ -2331,7 +2480,6 @@ class RoutingInstanceST(DBBaseST):
                 self.stale_route_targets.remove(rt)
         if update:
             try:
-                self._logger.error("update_route_target_list_02  {0}  Stale RT: {1} ".format(self.name, self.stale_route_targets))
                 self._vnc_lib.routing_instance_update(self.obj)
             except NoIdError:
                 return
@@ -2340,7 +2488,6 @@ class RoutingInstanceST(DBBaseST):
     def update_static_routes(self):
         if not self.is_default:
             return
-        self._logger.error("update_static_routes_01  START: {0} ".format(self.name))
         old_static_routes = self.obj.get_static_route_entries()
         static_routes = StaticRouteEntriesType()
         old_route_target_list = set()
@@ -2350,7 +2497,6 @@ class RoutingInstanceST(DBBaseST):
         all_route_targets = set()
         si_set = ServiceInstanceST.get_vn_si_mapping(self.virtual_network)
         for si in si_set or []:
-            self._logger.error("update_static_routes_02  LOOP: {0} SI {1} ".format(self.name, si))
             mode = si.get_service_mode()
             if mode is None or mode != 'in-network-nat':
                 self._logger.debug("service mode for %s-%s, skip" % (si.name, mode))
@@ -2386,8 +2532,7 @@ class RoutingInstanceST(DBBaseST):
                     static_routes.add_route(static_route)
                     all_route_targets |= route_targets
 
-        if old_route_target_list != all_route_targets:
-            self._logger.error("update_static_routes_02: {0} old_rts: {1} all_rts: {2}".format(self.name, old_route_target_list, all_route_targets))
+        if old_route_target_list != all_route_targets and si_set is not None:
             self.update_route_target_list(
                     rt_add_import=all_route_targets - old_route_target_list,
                     rt_del=old_route_target_list - all_route_targets)
@@ -2423,7 +2568,7 @@ class RoutingInstanceST(DBBaseST):
                 ri2.connections.discard(self.name)
 
         rtgt_list = self.obj.get_route_target_refs()
-        self._cassandra.free_route_target(self.name)
+        self._object_db.free_route_target(self.name)
 
         service_chain = self.service_chain
         vn_obj = VirtualNetworkST.get(self.virtual_network)
@@ -2439,7 +2584,7 @@ class RoutingInstanceST(DBBaseST):
                 if vmi:
                     vm_pt_list = vmi.get_virtual_machine_or_port_tuple()
                     for vm_pt in vm_pt_list:
-                        self._cassandra.free_service_chain_vlan(vm_pt.uuid,
+                        self._object_db.free_service_chain_vlan(vm_pt.uuid,
                                                              service_chain)
                     vmi.delete_routing_instance(self)
             # end for vmi_name
@@ -2468,7 +2613,6 @@ class RoutingInstanceST(DBBaseST):
                         self._vnc_lib.route_aggregate_update(ra_obj)
                 except NoIdError:
                     pass
-
         self.routing_policys = {}
         self.route_aggregates = set()
         bgpaas_server_name = self.obj.get_fq_name_str() + ':bgpaas-server'
@@ -2529,7 +2673,7 @@ class ServiceChain(DBBaseST):
     @classmethod
     def init(cls):
         # When schema transformer restarts, read all service chains from cassandra
-        for (name, columns) in cls._cassandra.list_service_chain_uuid():
+        for (name, columns) in cls._object_db.list_service_chain_uuid():
             chain = jsonpickle.decode(columns['value'])
 
             # Some service chains may not be valid any more. We may need to
@@ -2537,8 +2681,7 @@ class ServiceChain(DBBaseST):
             # To handle each case, we mark them with two separate flags,
             # which will be reset when appropriate calls are made.
             # Any service chains for which these flags are still set after
-            # all search results are received from ifmap, we will delete/
-            # destroy them
+            # all objects are read from database, we will delete/destroy them
             chain.present_stale = True
             chain.created_stale = chain.created
             if not hasattr(chain, 'partially_created'):
@@ -2546,7 +2689,18 @@ class ServiceChain(DBBaseST):
             if not hasattr(chain, 'si_info'):
                 chain.si_info = None
             cls._dict[name] = chain
+        cls.sc_ipam_obj = None
+        cls._get_service_chain_ipam()
     # end init
+
+    @classmethod
+    def _get_service_chain_ipam(cls):
+        if cls.sc_ipam_obj:
+            return cls.sc_ipam_obj
+        fq_name = ['default-domain', 'default-project', 'service-chain-flat-ipam']
+        cls.sc_ipam_obj = cls._vnc_lib.network_ipam_read(fq_name=fq_name)
+        return cls.sc_ipam_obj
+    # end _get_service_chain_ipam
 
     def __init__(self, name, left_vn, right_vn, direction, sp_list, dp_list,
                  protocol, services):
@@ -2616,7 +2770,7 @@ class ServiceChain(DBBaseST):
         sc = ServiceChain(name, left_vn, right_vn, direction, sp_list,
                           dp_list, protocol, service_list)
         ServiceChain._dict[name] = sc
-        cls._cassandra.add_service_chain_uuid(name, jsonpickle.encode(sc))
+        cls._object_db.add_service_chain_uuid(name, jsonpickle.encode(sc))
         return sc
     # end find_or_create
 
@@ -2787,8 +2941,11 @@ class ServiceChain(DBBaseST):
             self.log_error("vn1_obj or vn2_obj is None")
             return
 
+        right_si_name = self.service_list[-1]
+        right_si = ServiceInstanceST.get(right_si_name)
         multi_policy_enabled = (vn1_obj.multi_policy_service_chains_enabled and
-                                vn2_obj.multi_policy_service_chains_enabled)
+                                vn2_obj.multi_policy_service_chains_enabled and
+                                right_si.get_service_mode() != 'in-network-nat')
         service_ri2 = None
         if not multi_policy_enabled:
             service_ri2 = vn1_obj.get_primary_routing_instance()
@@ -2882,7 +3039,7 @@ class ServiceChain(DBBaseST):
         self.created = True
         self.partially_created = False
         self.error_msg = None
-        self._cassandra.add_service_chain_uuid(self.name, jsonpickle.encode(self))
+        self._object_db.add_service_chain_uuid(self.name, jsonpickle.encode(self))
     # end _create
 
     def add_pbf_rule(self, vmi, ri, v4_address, v6_address, vlan):
@@ -2905,7 +3062,7 @@ class ServiceChain(DBBaseST):
 
     def process_transparent_service(self, vm_info, v4_address, v6_address,
                                     service_ri1, service_ri2):
-        vlan = self._cassandra.allocate_service_chain_vlan(vm_info['vm_uuid'],
+        vlan = self._object_db.allocate_service_chain_vlan(vm_info['vm_uuid'],
                                                            self.name)
         self.add_pbf_rule(vm_info['left']['vmi'], service_ri1,
                           v4_address, v6_address, vlan)
@@ -2935,7 +3092,7 @@ class ServiceChain(DBBaseST):
 
         self.created = False
         self.partially_created = False
-        self._cassandra.add_service_chain_uuid(self.name,
+        self._object_db.add_service_chain_uuid(self.name,
                                                jsonpickle.encode(self))
 
         vn1_obj = VirtualNetworkST.get(self.left_vn)
@@ -2955,7 +3112,7 @@ class ServiceChain(DBBaseST):
         if self.created or self.partially_created:
             self.destroy()
         del self._dict[self.name]
-        self._cassandra.remove_service_chain_uuid(self.name)
+        self._object_db.remove_service_chain_uuid(self.name)
     # end delete
 
     def build_introspect(self):
@@ -3022,7 +3179,6 @@ class AclRuleListST(object):
     def _port_is_subset(lhs, rhs):
         return (lhs.start_port >= rhs.start_port and
                 (rhs.end_port == -1 or lhs.end_port <= rhs.end_port))
-
 
     @staticmethod
     def _address_is_subset(lhs, rhs):
@@ -3102,7 +3258,7 @@ class BgpRouterST(DBBaseST):
     def delete_obj(self):
         self.update_single_ref('bgp_as_a_service', {})
         if self.router_type == 'bgpaas-client':
-            self._cassandra.free_bgpaas_port(self.source_port)
+            self._object_db.free_bgpaas_port(self.source_port)
     # end delete_ref
 
     def set_params(self, params):
@@ -3244,11 +3400,12 @@ class BgpRouterST(DBBaseST):
         if update:
             self.obj.set_bgp_router_parameters(params)
         router_refs = self.obj.get_bgp_router_refs()
-        peering_attribs = router_refs[0]['attr']
-        if peering_attribs != bgpaas.peering_attribs:
-            self.obj.set_bgp_router_list([router_refs[0]['to']],
-                                         [bgpaas.peering_attribs])
-            update = True
+        if router_refs:
+            peering_attribs = router_refs[0]['attr']
+            if peering_attribs != bgpaas.peering_attribs:
+                self.obj.set_bgp_router_list([router_refs[0]['to']],
+                                             [bgpaas.peering_attribs])
+                update = True
 
         old_refs = self.obj.get_virtual_machine_interface_back_refs() or []
         old_uuids = set([ref['uuid'] for ref in old_refs])
@@ -3442,7 +3599,7 @@ class BgpAsAServiceST(DBBaseST):
             bgp_router = BgpRouter(bgpr_name, parent_obj=ri.obj)
             create = True
             try:
-                src_port = self._cassandra.alloc_bgpaas_port(router_fq_name)
+                src_port = self._object_db.alloc_bgpaas_port(router_fq_name)
             except ResourceExhaustionError as e:
                 self._logger.error("Cannot allocate BGPaaS port for %s:%s" % (
                     router_fq_name, str(e)))
@@ -3510,15 +3667,10 @@ class VirtualMachineInterfaceST(DBBaseST):
 
     def update(self, obj=None):
         changed = self.update_vnc_obj(obj)
-        self._logger.error("XXXXXXX update: {0} changed: {1} RI: {2}".format(self.obj.name, changed, self.routing_instances))
         if 'virtual_machine_interface_properties' in changed:
             self.set_properties()
         if 'routing_instance' in changed:
-            self._logger.error("XXXXXXX routing instance refs update for: {0} RI: {1}".format(self.obj.name,self.obj.get_routing_instance_refs()))
             self.update_routing_instances(self.obj.get_routing_instance_refs())
-        if 'logical_router' not in changed:
-            self.update_single_ref('logical_router', self.obj)
-        self.update_multiple_refs('port_tuple', self.obj)
         return changed
     # end update
 
@@ -3568,7 +3720,6 @@ class VirtualMachineInterfaceST(DBBaseST):
     # end get_primary_instance_ip_address
 
     def set_properties(self):
-        self._logger.error("XXXXXXX set_properties: {0} name: {1} RI: {2} LR: {3}".format(self.obj.uuid, self.name, self.routing_instances, self.logical_router))
         props = self.obj.get_virtual_machine_interface_properties()
         if props:
             service_interface_type = props.service_interface_type
@@ -3583,17 +3734,14 @@ class VirtualMachineInterfaceST(DBBaseST):
         if interface_mirror != self.interface_mirror:
             self.interface_mirror = interface_mirror
             ret = True
-        self._logger.error("XXXXXXX set_properties end: {0} name: {1} RI: {2} LR: {3}".format(self.obj.uuid, self.name, self.routing_instances, self.logical_router))
         return ret
     # end set_properties
 
     def update_routing_instances(self, ri_refs):
         routing_instances = dict((':'.join(ref['to']), ref['attr'])
                                  for ref in ri_refs or [])
-        self._logger.error("update_routing_instances_01 new routing instance refs: {}".format(routing_instances))
         old_ri_set = set(self.routing_instances.keys())
         new_ri_set = set(routing_instances.keys())
-        self._logger.error("update_routing_instances_02 old refs: {0} new refs: {1}".format(old_ri_set, new_ri_set))
         for ri_name in old_ri_set - new_ri_set:
             ri = RoutingInstanceST.get(ri_name)
             if ri:
@@ -3602,7 +3750,6 @@ class VirtualMachineInterfaceST(DBBaseST):
             ri = RoutingInstanceST.get(ri_name)
             if ri:
                 ri.virtual_machine_interfaces.add(self.name)
-        self._logger.error("update_routing_instances_03 {}".format(self.name))
         self.routing_instances = routing_instances
     # end update_routing_instances
 
@@ -3639,7 +3786,7 @@ class VirtualMachineInterfaceST(DBBaseST):
             vm = VirtualMachineST.get(self.virtual_machine)
             return [vm] if vm is not None else []
         return []
-    # end get_virtual_machine_or_port_tuple
+    # end get_service_instance
 
     def _add_pbf_rules(self):
         if not (self.is_left() or self.is_right()):
@@ -3647,7 +3794,7 @@ class VirtualMachineInterfaceST(DBBaseST):
 
         vm_pt_list = self.get_virtual_machine_or_port_tuple()
         for vm_pt in vm_pt_list:
-            if not vm_pt or vm_pt.get_service_mode() != 'transparent':
+            if vm_pt.get_service_mode() != 'transparent':
                 return
             for service_chain in ServiceChain.values():
                 if vm_pt.service_instance not in service_chain.service_list:
@@ -3666,11 +3813,12 @@ class VirtualMachineInterfaceST(DBBaseST):
                 service_ri = RoutingInstanceST.get(service_name)
                 v4_address, v6_address = vn1_obj.allocate_service_chain_ip(
                     service_name)
-                vlan = self._cassandra.allocate_service_chain_vlan(
+                vlan = self._object_db.allocate_service_chain_vlan(
                     vm_pt.uuid, service_chain.name)
 
                 service_chain.add_pbf_rule(self, service_ri, v4_address,
                                            v6_address, vlan)
+            #end for service_chain
         #end for vm_pt
     # end _add_pbf_rules
 
@@ -3726,7 +3874,6 @@ class VirtualMachineInterfaceST(DBBaseST):
                 self._set_vrf_assign_table(None)
                 return
 
-            vrf_table = VrfAssignTableType()
             ip_list = []
             for ip_name in self.instance_ips:
                 ip = InstanceIpST.get(ip_name)
@@ -3779,15 +3926,16 @@ class VirtualMachineInterfaceST(DBBaseST):
                                 mc = MatchConditionType(src_port=sp,
                                                         dst_port=dp,
                                                         protocol=service_chain.protocol)
-
                             vrf_rule = VrfAssignRuleType(match_condition=mc,
                                                          routing_instance=ri_name,
                                                          ignore_acl=True)
                             vrf_table.add_vrf_assign_rule(vrf_rule)
                             policy_rule_count += 1
+                        # end for dp
+                    # end for sp
                 # end for service_chain
             # end for service_chain_list
-        #end for vm_pt_list
+        # end for vm_pt_list
         if policy_rule_count == 0:
             vrf_table = None
         self._set_vrf_assign_table(vrf_table)
@@ -3804,7 +3952,6 @@ class VirtualMachineInterfaceST(DBBaseST):
                 if e._unknown_id == self.uuid:
                     VirtualMachineInterfaceST.delete(self.name)
     # _set_vrf_assign_table
-
 
     def handle_st_object_req(self):
         resp = super(VirtualMachineInterfaceST, self).handle_st_object_req()
@@ -3973,7 +4120,7 @@ class VirtualMachineST(DBBaseST):
 class LogicalRouterST(DBBaseST):
     _dict = {}
     obj_type = 'logical_router'
-    ref_fields = ['virtual_machine_interface', 'route_table']
+    ref_fields = ['virtual_machine_interface', 'route_table', 'bgpvpn']
     prop_fields = ['configured_route_target_list']
     def __init__(self, name, obj=None):
         self.name = name
@@ -3982,9 +4129,17 @@ class LogicalRouterST(DBBaseST):
         self.route_tables = set()
         self.rt_list = set()
         self.configured_route_target_list = None
-        obj = obj or self.read_vnc_obj(fq_name=name)
+        self.bgpvpns = set()
+        self.bgpvpn_rt_list = set()
+        self.bgpvpn_import_rt_list = set()
+        self.bgpvpn_export_rt_list = set()
+        self.update_vnc_obj()
+        proj_obj = self.read_vnc_obj(self.obj.parent_uuid,
+                                     obj_type='project',
+                                     fields=['vxlan_routing'])
+        self.vxlan_routing = proj_obj.get_vxlan_routing()
 
-        rt_ref = obj.get_route_target_refs()
+        rt_ref = self.obj.get_route_target_refs()
         old_rt_key = None
         if rt_ref:
             rt_key = rt_ref[0]['to'][0]
@@ -3993,37 +4148,31 @@ class LogicalRouterST(DBBaseST):
                 old_rt_key = rt_key
                 rt_ref = None
         if not rt_ref:
-            rtgt_num = self._cassandra.alloc_route_target(name, True)
+            rtgt_num = self._object_db.alloc_route_target(name, True)
             rt_key = "target:%s:%d" % (
                 GlobalSystemConfigST.get_autonomous_system(), rtgt_num)
             rtgt_obj = RouteTargetST.locate(rt_key)
-            obj.set_route_target(rtgt_obj.obj)
-            self._vnc_lib.logical_router_update(obj)
+            self.obj.set_route_target(rtgt_obj.obj)
+            self._vnc_lib.logical_router_update(self.obj)
 
         if old_rt_key:
             RouteTargetST.delete_vnc_obj(old_rt_key)
         self.route_target = rt_key
-        self.update(obj)
     # end __init__
 
-    def update(self, obj=None):
-        changed = self.update_vnc_obj(obj)
-        if not changed:
-            return False
-        if 'virtual_machine_interface' in changed:
-            self.update_virtual_networks()
-        rt_list = self.obj.get_configured_route_target_list() or RouteTargetList()
-        self.set_route_target_list(rt_list)
-        return changed
-    # end update
+    def evaluate(self):
+        self.update_virtual_networks()
+        self.set_route_target_list()
+    # end evaluate
 
     def delete_obj(self):
         self.update_multiple_refs('virtual_machine_interface', {})
         self.update_multiple_refs('route_table', {})
+        self.update_multiple_refs('bgpvpn', {})
         self.update_virtual_networks()
         rtgt_num = int(self.route_target.split(':')[-1])
-        RouteTargetST.delete_vnc_obj(self.route_target)
-        self._cassandra.free_route_target(self.name)
+        self.delete_route_targets([self.route_target])
+        self._object_db.free_route_target(self.name)
     # end delete_obj
 
     def update_virtual_networks(self):
@@ -4038,18 +4187,38 @@ class LogicalRouterST(DBBaseST):
     # end update_virtual_networks
 
     def set_virtual_networks(self, vn_set):
+        # do not add RT assigned to LR to the VN
+        # when vxlan_routing is enabled
+        if self.vxlan_routing:
+            self.virtual_networks = vn_set
+            return
         for vn in self.virtual_networks - vn_set:
             vn_obj = VirtualNetworkST.get(vn)
             if vn_obj is not None:
                 ri_obj = vn_obj.get_primary_routing_instance()
-                ri_obj.update_route_target_list(
-                    rt_add=set(), rt_del=self.rt_list|set([self.route_target]))
+                # error due to inconsistency in db
+                if ri_obj is None:
+                    self._logger.error(
+                        "Primary RI is None for VN: " + str(vn_obj.name))
+                    continue
+                rt_del = (set([self.route_target]) |
+                          self.rt_list |
+                          self.bgpvpn_rt_list |
+                          self.bgpvpn_import_rt_list |
+                          self.bgpvpn_export_rt_list)
+                ri_obj.update_route_target_list(rt_add=set(), rt_del=rt_del)
+                self.delete_route_targets(rt_del - set([self.route_target]))
         for vn in vn_set - self.virtual_networks:
             vn_obj = VirtualNetworkST.get(vn)
             if vn_obj is not None:
                 ri_obj = vn_obj.get_primary_routing_instance()
+                rt_add = (self.rt_list |
+                          set([self.route_target]) |
+                          self.bgpvpn_rt_list)
                 ri_obj.update_route_target_list(
-                    rt_add=self.rt_list|set([self.route_target]))
+                    rt_add=rt_add,
+                    rt_add_import=self.bgpvpn_import_rt_list,
+                    rt_add_export=self.bgpvpn_export_rt_list)
         self.virtual_networks = vn_set
     # end set_virtual_networks
 
@@ -4074,22 +4243,69 @@ class LogicalRouterST(DBBaseST):
                 ri_obj = vn_obj.get_primary_routing_instance()
                 ri_obj.update_route_target_list(rt_del=[old_rt],
                                                 rt_add=[rt_key])
-        RouteTargetST.delete_vnc_obj(old_rt)
+        self.delete_route_targets([old_rt])
         self.route_target = rt_key
     # end update_autonomous_system
 
-    def set_route_target_list(self, rt_list):
-        old_rt_list = self.rt_list
-        self.rt_list = set(rt_list.get_route_target())
-        rt_add = self.rt_list - old_rt_list
-        rt_del = old_rt_list - self.rt_list
+    def set_route_target_list(self):
+        old_rt_list = self.rt_list.copy()
+        old_bgpvpn_rt_list = self.bgpvpn_rt_list.copy()
+        old_bgpvpn_import_rt_list = self.bgpvpn_import_rt_list.copy()
+        old_bgpvpn_export_rt_list = self.bgpvpn_export_rt_list.copy()
+
+        # Set the system allocated route target
+        config_rt_list = self.configured_route_target_list\
+            or RouteTargetList()
+        self.rt_list = set(config_rt_list.get_route_target())
+
+        # Get BGP VPN's route targets associated to that router
+        self.bgpvpn_rt_list = set()
+        self.bgpvpn_import_rt_list = set()
+        self.bgpvpn_export_rt_list = set()
+        for bgpvpn_name in self.bgpvpns:
+            bgpvpn = BgpvpnST.get(bgpvpn_name)
+            if bgpvpn is not None:
+                self.bgpvpn_rt_list |= bgpvpn.rt_list
+                self.bgpvpn_import_rt_list |= bgpvpn.import_rt_list
+                self.bgpvpn_export_rt_list |= bgpvpn.export_rt_list
+
+        rt_add = ((self.rt_list - old_rt_list) |
+                  (self.bgpvpn_rt_list - old_bgpvpn_rt_list))
+        rt_add_import = self.bgpvpn_import_rt_list - old_bgpvpn_import_rt_list
+        rt_add_export = self.bgpvpn_export_rt_list - old_bgpvpn_export_rt_list
+        rt_del = (
+            ((old_rt_list - self.rt_list) |
+             (old_bgpvpn_rt_list - self.bgpvpn_rt_list) |
+             (old_bgpvpn_import_rt_list - self.bgpvpn_import_rt_list) |
+             (old_bgpvpn_export_rt_list - self.bgpvpn_export_rt_list)) -
+            (self.rt_list | self.bgpvpn_rt_list | self.bgpvpn_import_rt_list |
+             self.bgpvpn_export_rt_list)
+        )
+        if not (rt_add or rt_add_import or rt_add_export or rt_del):
+            return
 
         for vn in self.virtual_networks:
+            # do not add RT assigned to LR to the VN
+            # when vxlan_routing is enabled
+            if self.vxlan_routing:
+                continue
             vn_obj = VirtualNetworkST.get(vn)
             if vn_obj is not None:
                 ri_obj = vn_obj.get_primary_routing_instance()
-                ri_obj.update_route_target_list(rt_del=rt_del, rt_add=rt_add)
+                ri_obj.update_route_target_list(rt_add=rt_add,
+                                                rt_add_import=rt_add_import,
+                                                rt_add_export=rt_add_export,
+                                                rt_del=rt_del)
+        self.delete_route_targets(rt_del)
     # end set_route_target_list
+
+    @staticmethod
+    def delete_route_targets(route_targets=None):
+        for rt in route_targets or []:
+            try:
+                RouteTargetST.delete_vnc_obj(rt)
+            except RefsExistError:
+                pass
 
     def handle_st_object_req(self):
         resp = super(LogicalRouterST, self).handle_st_object_req()
@@ -4098,6 +4314,12 @@ class LogicalRouterST(DBBaseST):
         ])
         resp.properties.extend([
             sandesh.PropList('route_target', self.route_target),
+            sandesh.PropList('bgpvpn_router_target_list',
+                             ', '.join(self.bgpvpn_rt_list)),
+            sandesh.PropList('bgpvpn_import_route_targt_list',
+                             ', '.join(self.bgpvpn_import_rt_list)),
+            sandesh.PropList('bgpvpn_export_route_target_list',
+                             ', '.join(self.bgpvpn_export_rt_list)),
         ])
         return resp
     # end handle_st_object_req
@@ -4149,9 +4371,9 @@ class ServiceInstanceST(DBBaseST):
 
     def get_allocated_interface_ip(self, side, version):
         vm_pt_list = []
-        for vm_name in  self.virtual_machines or []:
+        for vm_name in self.virtual_machines or []:
             vm_pt_list.append(VirtualMachineST.get(vm_name))
-        for pt_name in  self.port_tuples or []:
+        for pt_name in self.port_tuples or []:
             vm_pt_list.append(PortTupleST.get(pt_name))
         for vm_pt in vm_pt_list:
             if not vm_pt:
@@ -4388,6 +4610,7 @@ class RoutingPolicyST(DBBaseST):
     # end handle_st_object_req
 # end RoutingPolicyST
 
+
 class RouteAggregateST(DBBaseST):
     _dict = {}
     obj_type = 'route_aggregate'
@@ -4520,3 +4743,132 @@ class PortTupleST(DBBaseST):
         return resp
     # end handle_st_object_req
 # end PortTupleST
+
+
+class BgpvpnST(DBBaseST):
+    _dict = {}
+    obj_type = 'bgpvpn'
+    prop_fields = ['route_target_list', 'import_route_target_list',
+                   'export_route_target_list']
+
+    def __init__(self, name, obj=None):
+        self.name = name
+        self.virtual_networks = set()
+        self.logical_routers = set()
+        self.rt_list = set()
+        self.import_rt_list = set()
+        self.export_rt_list = set()
+        self.update(obj)
+        self.update_multiple_refs('virtual_network', self.obj)
+        self.update_multiple_refs('logical_router', self.obj)
+
+    def update(self, obj=None):
+        changed = self.update_vnc_obj(obj)
+        if set(self.prop_fields) & set(changed):
+            self.get_route_target_lists()
+        return changed
+
+    def delete_obj(self):
+        self.update_multiple_refs('virtual_network', {})
+        self.update_multiple_refs('logical_router', {})
+
+    def get_route_target_lists(self):
+        old_lists = (self.rt_list, self.import_rt_list, self.export_rt_list)
+        rt_list = self.obj.get_route_target_list()
+        if rt_list:
+            self.rt_list = set(rt_list.get_route_target())
+        else:
+            self.rt_list = set()
+        rt_list = self.obj.get_import_route_target_list()
+        if rt_list:
+            self.import_rt_list = set(rt_list.get_route_target())
+        else:
+            self.import_rt_list = set()
+        rt_list = self.obj.get_export_route_target_list()
+        if rt_list:
+            self.export_rt_list = set(rt_list.get_route_target())
+        else:
+            self.export_rt_list = set()
+
+        # if any RT exists in both import and export, just add it to rt_list
+        self.rt_list |= self.import_rt_list & self.export_rt_list
+        # if any RT exists in rt_list, remove it from import/export lists
+        self.import_rt_list -= self.rt_list
+        self.export_rt_list -= self.rt_list
+        return old_lists != (self.rt_list, self.import_rt_list,
+                             self.export_rt_list)
+
+    def handle_st_object_req(self):
+        resp = super(BgpvpnST, self).handle_st_object_req()
+        resp.obj_refs = [
+            self._get_sandesh_ref_list('virtual_network'),
+            self._get_sandesh_ref_list('logical_router'),
+        ]
+        return resp
+
+
+class SecurityLoggingObjectST(DBBaseST):
+    _dict = {}
+    obj_type = 'security_logging_object'
+    ref_fields = ['network_policy', 'security_group']
+    prop_fields = ['security_logging_object_rate']
+
+    def __init__(self, name, obj=None):
+        self.name = name
+        self.network_policys = {}
+        self.security_groups = {}
+        self.security_logging_object_rate = None
+        self.security_logging_object_rules = set()
+        self.update(obj)
+        self.uuid = self.obj.uuid
+    # end __init__
+
+    def evaluate(self):
+        rule_entries = set()
+        if self.network_policys:
+            rule_entries = self.populate_rules('network_policy',
+                                               self.network_policys)
+        if self.security_groups:
+            rule_entries |= self.populate_rules('security_group',
+                                                self.security_groups)
+        # Update the rules if it has changed.
+        if (rule_entries != self.security_logging_object_rules):
+            self.obj.set_security_logging_object_rules(
+                        SecurityLoggingObjectRuleListType(list(rule_entries)))
+            self._vnc_lib.security_logging_object_update(self.obj)
+            self.security_logging_object_rules = rule_entries
+
+    def populate_rules(self, rule_type, refs):
+        rule_entries = set()
+        for np_sg, attr in refs.items():
+            if attr and attr.rule:
+                # List of rule UUIDs is provided. Populate
+                # the SLO with the list alone.
+                np_sg_rule_list = attr.rule
+            else:
+                # No rule uuid is specified. Query for the
+                # network policy or security group
+                # and include all rules in them.
+                # Use the default rule rate in the SLO.
+                np_sg_st_obj = (NetworkPolicyST.get(np_sg) or
+                                SecurityGroupST.get(np_sg))
+                np_sg_rule_list = getattr(np_sg_st_obj.obj,
+                                         'get_'+rule_type+'_entries')(
+                                             ).get_policy_rule()
+            for rule_entry in np_sg_rule_list:
+                rate_to_use = (getattr(rule_entry, 'rate', None) or
+                               self.security_logging_object_rate)
+                rule_entries.add(SecurityLoggingObjectRuleEntryType(
+                               rule_entry.rule_uuid, rate=rate_to_use))
+            # end for rule_entry
+        # end for np_sg
+        return rule_entries
+    # end populate_rules
+
+    def handle_st_object_req(self):
+        resp = super(SecurityLoggingObjectST, self).handle_st_object_req()
+        resp.properties = [
+            sandesh.PropList('rule', str(rule)) for rule in self.security_logging_object_rules
+        ]
+        return resp
+# end SecurityLoggingObjectST
